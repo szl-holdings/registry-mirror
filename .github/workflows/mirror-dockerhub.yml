@@ -1,0 +1,122 @@
+# Copyright 2026 SZL Holdings — SPDX-License-Identifier: Apache-2.0
+name: Mirror GHCR images to Docker Hub
+
+# GHCR (ghcr.io/szl-holdings/*) stays the canonical, provenance-attested registry.
+# This job mirrors selected tags of selected images to docker.io/szlholdings/* by
+# digest-preserving copy (crane), so the Docker Hub tag is byte-identical to GHCR.
+#
+# Fail-closed / honest:
+#   * If DOCKERHUB_USERNAME / DOCKERHUB_TOKEN are not installed as repository secrets the
+#     job prints SETUP_REQUIRED and exits 0 (least privilege: the Docker Hub token is visible only to this one-purpose repository) — nothing is mirrored and nothing is claimed.
+#   * Every copy is verified by comparing source and destination digests; a mismatch
+#     fails the run. A receipt artifact lists image, tag, digests and result.
+#   * Only `latest` and release-looking tags (x.y.z, vx.y.z, uds-vx.y.z) are mirrored.
+#     Per-commit `sha-*` tags are not.
+#   * Codename images are excluded by doctrine (no user-visible codename on a public surface).
+
+on:
+  schedule:
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CRANE_VERSION: v0.22.1
+  CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+  SOURCE_ORG: ghcr.io/szl-holdings
+  DEST_ORG: docker.io/szlholdings
+  IMAGES: a11oy a11oy-bundle hatun-mcp killinchu killinchu-bundle szl-mesh szl-receipts szl-receipts-server szl-uds-bundle
+
+jobs:
+  mirror:
+    name: digest-preserving mirror
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Check Docker Hub credentials are installed
+        id: creds
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "::warning::SETUP_REQUIRED — repository secrets DOCKERHUB_USERNAME / DOCKERHUB_TOKEN are not installed (gh secret set ... --repo szl-holdings/registry-mirror). Nothing mirrored."
+            echo "state=SETUP_REQUIRED" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=READY" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install crane (pinned release, checksum verified)
+        if: steps.creds.outputs.state == 'READY'
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" -o crane.tgz
+          echo "${CRANE_SHA256}  crane.tgz" | sha256sum -c -
+          tar xzf crane.tgz crane
+          ./crane version
+
+      - name: Authenticate (GHCR read, Docker Hub write)
+        if: steps.creds.outputs.state == 'READY'
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | ./crane auth login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          printf '%s' "$DOCKERHUB_TOKEN" | ./crane auth login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin
+
+      - name: Mirror release tags and verify digests
+        if: steps.creds.outputs.state == 'READY'
+        run: |
+          set -euo pipefail
+          : > receipt.jsonl
+          fail=0
+          for img in $IMAGES; do
+            tags="$(./crane ls "$SOURCE_ORG/$img" 2>/dev/null | grep -E '^(latest|v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?|uds-v[0-9]+\.[0-9]+\.[0-9]+)$' || true)"
+            if [ -z "$tags" ]; then
+              jq -cn --arg i "$img" '{image:$i, result:"NO_RELEASE_TAGS"}' >> receipt.jsonl; continue
+            fi
+            for t in $tags; do
+              src="$SOURCE_ORG/$img:$t"; dst="$DEST_ORG/$img:$t"
+              sdig="$(./crane digest "$src")"
+              ddig="$(./crane digest "$dst" 2>/dev/null || true)"
+              if [ "$sdig" = "$ddig" ]; then
+                jq -cn --arg i "$img" --arg t "$t" --arg d "$sdig" '{image:$i, tag:$t, digest:$d, result:"ALREADY_IDENTICAL"}' >> receipt.jsonl; continue
+              fi
+              if ./crane copy "$src" "$dst"; then
+                ndig="$(./crane digest "$dst")"
+                if [ "$sdig" = "$ndig" ]; then
+                  jq -cn --arg i "$img" --arg t "$t" --arg d "$sdig" '{image:$i, tag:$t, digest:$d, result:"MIRRORED_VERIFIED"}' >> receipt.jsonl
+                else
+                  fail=1; jq -cn --arg i "$img" --arg t "$t" --arg s "$sdig" --arg d "$ndig" '{image:$i, tag:$t, source_digest:$s, dest_digest:$d, result:"DIGEST_MISMATCH"}' >> receipt.jsonl
+                fi
+              else
+                fail=1; jq -cn --arg i "$img" --arg t "$t" '{image:$i, tag:$t, result:"COPY_FAILED"}' >> receipt.jsonl
+              fi
+            done
+          done
+          echo "---- receipt ----"; cat receipt.jsonl
+          jq -s '{ts:(now|todate), run:env.GITHUB_RUN_ID, source:env.SOURCE_ORG, dest:env.DEST_ORG, entries:., summary:(group_by(.result)|map({(.[0].result):length})|add)}' receipt.jsonl > mirror-receipt.json
+          [ "$fail" -eq 0 ] || { echo "::error::one or more copies failed or did not verify"; exit 1; }
+
+      - name: Persist receipt
+        if: always() && steps.creds.outputs.state == 'READY'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dockerhub-mirror-receipt-${{ github.run_id }}
+          path: |
+            mirror-receipt.json
+            receipt.jsonl
+          if-no-files-found: warn
+          retention-days: 90
