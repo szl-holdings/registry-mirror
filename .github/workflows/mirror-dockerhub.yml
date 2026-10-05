@@ -90,13 +90,28 @@ jobs:
             grep -Eiq 'unexpected status code (401|403|429)([^0-9]|$)|(^|[^[:alnum:]_])(UNAUTHORIZED|DENIED|TOOMANYREQUESTS)([^[:alnum:]_]|$)|incorrect username or password|too many failed login attempts' "$crane_error"
           }
           for img in $IMAGES; do
-            tags="$(./crane ls "$SOURCE_ORG/$img" 2>/dev/null | grep -E '^(latest|v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?|uds-v[0-9]+\.[0-9]+\.[0-9]+)$' || true)"
+            # A failed listing is not proof that a source has no release tags.
+            # Discard even partial stdout until the complete listing succeeds.
+            if ! all_tags="$(./crane ls "$SOURCE_ORG/$img" 2>"$crane_error")"; then
+              cat "$crane_error" >&2
+              fail=1
+              jq -cn --arg i "$img" '{image:$i, result:"SOURCE_TAG_LIST_FAILED"}' >> receipt.jsonl
+              if registry_access_blocked; then break; fi
+              continue
+            fi
+            tags="$(printf '%s\n' "$all_tags" | grep -E '^(latest|v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?|uds-v[0-9]+\.[0-9]+\.[0-9]+)$' || true)"
             if [ -z "$tags" ]; then
               jq -cn --arg i "$img" '{image:$i, result:"NO_RELEASE_TAGS"}' >> receipt.jsonl; continue
             fi
             for t in $tags; do
               src="$SOURCE_ORG/$img:$t"; dst="$DEST_ORG/$img:$t"
-              sdig="$(./crane digest "$src")"
+              if ! sdig="$(./crane digest "$src" 2>"$crane_error")"; then
+                cat "$crane_error" >&2
+                fail=1
+                jq -cn --arg i "$img" --arg t "$t" '{image:$i, tag:$t, result:"SOURCE_DIGEST_FAILED"}' >> receipt.jsonl
+                if registry_access_blocked; then break 2; fi
+                continue
+              fi
               if ! ddig="$(./crane digest "$dst" 2>"$crane_error")"; then
                 if registry_access_blocked; then
                   cat "$crane_error" >&2

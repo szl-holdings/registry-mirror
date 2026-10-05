@@ -31,10 +31,27 @@ def blocked():
     raise SystemExit(1)
 
 if args[0] == "ls":
+    if scenario == "blocked_source_list":
+        print("latest")  # An error may arrive after partial stdout.
+        blocked()
+    if scenario == "transient_source_list" and args[1].endswith("/first"):
+        print("latest")
+        print("Error: unexpected status code 503 Service Unavailable", file=sys.stderr)
+        raise SystemExit(1)
+    if scenario == "no_release_tags":
+        print("sha-excluded\nnot-a-release")
+        raise SystemExit(0)
+    if scenario == "empty_source_list":
+        raise SystemExit(0)
     print("latest\n1.0.0\nsha-excluded\nnot-a-release")
 elif args[0] == "digest":
     ref = args[1]
     if ref.startswith("ghcr.io/"):
+        if scenario == "blocked_source_digest":
+            blocked()
+        if scenario == "transient_source_digest" and ref.endswith("/first:latest"):
+            print("Error: unexpected status code 503 Service Unavailable", file=sys.stderr)
+            raise SystemExit(1)
         print(digest)
     elif scenario == "blocked_digest":
         blocked()
@@ -110,6 +127,55 @@ class MirrorContractTests(unittest.TestCase):
                 self.assertEqual(len(receipt["entries"]), 1)
                 self.assertEqual(receipt["entries"][0]["result"], "DESTINATION_ACCESS_BLOCKED")
                 self.assertIn(status, result.stderr)
+
+    def test_source_list_access_failure_does_not_claim_empty_or_use_partial_tags(self):
+        for status in ("401", "403", "429"):
+            with self.subTest(status=status):
+                result, calls, receipt = self.run_case("blocked_source_list", status)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(calls, [["ls", "ghcr.io/example/first"]])
+                self.assertEqual(receipt["summary"], {"SOURCE_TAG_LIST_FAILED": 1})
+                self.assertIn(status, result.stderr)
+
+    def test_source_list_transport_failure_preserves_failure_and_next_image(self):
+        result, calls, receipt = self.run_case("transient_source_list")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(receipt["summary"], {"SOURCE_TAG_LIST_FAILED": 1, "MIRRORED_VERIFIED": 2})
+        copied = [call for call in calls if call[0] == "copy"]
+        self.assertEqual(len(copied), 2)
+        self.assertTrue(all("/second:" in call[1] for call in copied))
+
+    def test_successful_source_listing_without_release_tags_remains_empty(self):
+        result, calls, receipt = self.run_case("no_release_tags")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(receipt["summary"], {"NO_RELEASE_TAGS": 2})
+        self.assertTrue(all(call[0] == "ls" for call in calls))
+
+    def test_successful_empty_source_listing_remains_empty(self):
+        result, calls, receipt = self.run_case("empty_source_list")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(receipt["summary"], {"NO_RELEASE_TAGS": 2})
+        self.assertTrue(all(call[0] == "ls" for call in calls))
+
+    def test_source_digest_access_failure_keeps_receipt_and_stops(self):
+        for status in ("401", "403", "429"):
+            with self.subTest(status=status):
+                result, calls, receipt = self.run_case("blocked_source_digest", status)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(receipt["summary"], {"SOURCE_DIGEST_FAILED": 1})
+                self.assertEqual(calls, [
+                    ["ls", "ghcr.io/example/first"],
+                    ["digest", "ghcr.io/example/first:latest"],
+                ])
+                self.assertIn(status, result.stderr)
+
+    def test_other_source_digest_failures_preserve_complete_receipts(self):
+        result, calls, receipt = self.run_case("transient_source_digest")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(receipt["summary"], {"SOURCE_DIGEST_FAILED": 1, "MIRRORED_VERIFIED": 3})
+        copied = [call for call in calls if call[0] == "copy"]
+        self.assertEqual(len(copied), 3)
+        self.assertNotIn("ghcr.io/example/first:latest", [call[1] for call in copied])
 
     def test_copy_access_failure_stops_remaining_tags_and_images(self):
         for status in ("401", "403", "429"):
