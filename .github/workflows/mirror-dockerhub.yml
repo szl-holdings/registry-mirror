@@ -82,6 +82,13 @@ jobs:
           set -euo pipefail
           : > receipt.jsonl
           fail=0
+          crane_error="$(mktemp)"
+          trap 'rm -f "$crane_error"' EXIT
+          registry_access_blocked() {
+            # Stop across the whole registry on definitive authorization or rate-limit
+            # failures. Retrying every remaining tag can turn a 401 into a lockout.
+            grep -Eiq 'unexpected status code (401|403|429)([^0-9]|$)|(^|[^[:alnum:]_])(UNAUTHORIZED|DENIED|TOOMANYREQUESTS)([^[:alnum:]_]|$)|incorrect username or password|too many failed login attempts' "$crane_error"
+          }
           for img in $IMAGES; do
             tags="$(./crane ls "$SOURCE_ORG/$img" 2>/dev/null | grep -E '^(latest|v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?|uds-v[0-9]+\.[0-9]+\.[0-9]+)$' || true)"
             if [ -z "$tags" ]; then
@@ -90,19 +97,36 @@ jobs:
             for t in $tags; do
               src="$SOURCE_ORG/$img:$t"; dst="$DEST_ORG/$img:$t"
               sdig="$(./crane digest "$src")"
-              ddig="$(./crane digest "$dst" 2>/dev/null || true)"
+              if ! ddig="$(./crane digest "$dst" 2>"$crane_error")"; then
+                if registry_access_blocked; then
+                  cat "$crane_error" >&2
+                  fail=1
+                  jq -cn --arg i "$img" --arg t "$t" '{image:$i, tag:$t, result:"DESTINATION_ACCESS_BLOCKED"}' >> receipt.jsonl
+                  break 2
+                fi
+                # A destination tag that does not exist yet still needs its first copy.
+                ddig=""
+              fi
               if [ "$sdig" = "$ddig" ]; then
                 jq -cn --arg i "$img" --arg t "$t" --arg d "$sdig" '{image:$i, tag:$t, digest:$d, result:"ALREADY_IDENTICAL"}' >> receipt.jsonl; continue
               fi
-              if ./crane copy "$src" "$dst"; then
-                ndig="$(./crane digest "$dst")"
+              if ./crane copy "$src" "$dst" 2>"$crane_error"; then
+                if ! ndig="$(./crane digest "$dst" 2>"$crane_error")"; then
+                  cat "$crane_error" >&2
+                  fail=1
+                  jq -cn --arg i "$img" --arg t "$t" '{image:$i, tag:$t, result:"DESTINATION_DIGEST_FAILED"}' >> receipt.jsonl
+                  if registry_access_blocked; then break 2; fi
+                  continue
+                fi
                 if [ "$sdig" = "$ndig" ]; then
                   jq -cn --arg i "$img" --arg t "$t" --arg d "$sdig" '{image:$i, tag:$t, digest:$d, result:"MIRRORED_VERIFIED"}' >> receipt.jsonl
                 else
                   fail=1; jq -cn --arg i "$img" --arg t "$t" --arg s "$sdig" --arg d "$ndig" '{image:$i, tag:$t, source_digest:$s, dest_digest:$d, result:"DIGEST_MISMATCH"}' >> receipt.jsonl
                 fi
               else
+                cat "$crane_error" >&2
                 fail=1; jq -cn --arg i "$img" --arg t "$t" '{image:$i, tag:$t, result:"COPY_FAILED"}' >> receipt.jsonl
+                if registry_access_blocked; then break 2; fi
               fi
             done
           done
