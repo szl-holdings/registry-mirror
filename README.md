@@ -19,6 +19,15 @@ a discovery surface with byte-identical tags.
 nothing is mirrored and nothing is claimed. Codename images (`rosie`, `sentra`, `amaru`) and
 `bundles-staging/*` are excluded by doctrine.
 
+With credentials installed, a registry authorization failure (401/403) or rate limit (429)
+stops the remaining image/tag attempts, retains a failure receipt, and fails the run. This
+prevents repeated bad-login attempts from escalating into a registry lockout. The owner
+must resolve the registry access failure before retrying; the workflow does not rotate or
+alter credentials. Other copy failures and digest mismatches also remain failures.
+
+The mirror loop contract is tested offline with `python3 -m unittest discover -s tests -v`
+(Python 3, Bash, and `jq` required); no registry credentials or network access are used.
+
 ## Owner step (once)
 
 1. Docker Hub → Account settings → Personal access tokens → New token, scope **Read & Write**, description `szl registry-mirror`.
