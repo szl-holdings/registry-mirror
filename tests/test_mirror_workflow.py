@@ -88,15 +88,23 @@ def mirror_script():
     return textwrap.dedent(body)
 
 
+def finalize_script():
+    """Read the actual receipt finalizer from the workflow."""
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    step = workflow.split("      - name: Finalize receipt for setup and preflight failures\n", 1)[1]
+    body = step.split("        run: |\n", 1)[1].split("\n      - name:", 1)[0]
+    return textwrap.dedent(body)
+
+
 class MirrorContractTests(unittest.TestCase):
     def run_case(self, scenario, status="401"):
         with tempfile.TemporaryDirectory() as directory:
             cwd = Path(directory)
             crane = cwd / "crane"
-            crane.write_text(FAKE_CRANE, encoding="utf-8")
+            crane.write_bytes(FAKE_CRANE.encode("utf-8"))
             crane.chmod(0o755)
             result = subprocess.run(
-                ["bash", "-c", mirror_script()],
+                [os.environ.get("BASH", "bash"), "-c", mirror_script()],
                 cwd=cwd,
                 env={
                     "PATH": os.environ["PATH"],
@@ -109,8 +117,9 @@ class MirrorContractTests(unittest.TestCase):
                 },
                 text=True,
                 capture_output=True,
-                timeout=20,
+                timeout=60 if os.name == "nt" else 20,
             )
+            self.assertTrue((cwd / "crane-calls.jsonl").exists(), result.stdout + result.stderr)
             calls = [
                 json.loads(line)
                 for line in (cwd / "crane-calls.jsonl").read_text().splitlines()
@@ -230,6 +239,79 @@ class MirrorContractTests(unittest.TestCase):
         result, calls, receipt = self.run_case("mismatch")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(receipt["summary"], {"DIGEST_MISMATCH": 4})
+
+
+class ReceiptFinalizerTests(unittest.TestCase):
+    def run_case(self, *, harden="success", creds="READY", install="success",
+                 auth="success", mirror="success", prior_lines=None, aggregate=None):
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            if prior_lines is not None:
+                (cwd / "receipt.jsonl").write_text(
+                    "\n".join(json.dumps(entry) for entry in prior_lines) + "\n",
+                    encoding="utf-8",
+                )
+            if aggregate is not None:
+                (cwd / "mirror-receipt.json").write_text(aggregate, encoding="utf-8")
+            result = subprocess.run(
+                [os.environ.get("BASH", "bash"), "-c", finalize_script()],
+                cwd=cwd,
+                env={
+                    "PATH": os.environ["PATH"],
+                    "HARDEN_OUTCOME": harden,
+                    "CREDS_STATE": creds,
+                    "INSTALL_OUTCOME": install,
+                    "AUTH_OUTCOME": auth,
+                    "MIRROR_OUTCOME": mirror,
+                    "GITHUB_RUN_ID": "offline-finalizer-test",
+                    "SOURCE_ORG": "ghcr.io/example",
+                    "DEST_ORG": "docker.io/example",
+                },
+                text=True,
+                capture_output=True,
+                timeout=20,
+            )
+            receipt_path = cwd / "mirror-receipt.json"
+            self.assertTrue(receipt_path.exists(), result.stdout + result.stderr)
+            return result, json.loads(receipt_path.read_text(encoding="utf-8"))
+
+    def test_setup_and_preflight_failures_emit_sanitized_receipts(self):
+        cases = (
+            ({"harden": "failure"}, "HARDEN_RUNNER_FAILED"),
+            ({"creds": "SETUP_REQUIRED", "install": "skipped", "auth": "skipped", "mirror": "skipped"}, "SETUP_REQUIRED"),
+            ({"creds": "", "install": "skipped", "auth": "skipped", "mirror": "skipped"}, "CREDENTIAL_CHECK_FAILED"),
+            ({"install": "failure", "auth": "skipped", "mirror": "skipped"}, "CRANE_INSTALL_FAILED"),
+            ({"auth": "failure", "mirror": "skipped"}, "REGISTRY_AUTH_FAILED"),
+        )
+        for settings, expected in cases:
+            with self.subTest(expected=expected):
+                result, receipt = self.run_case(**settings)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(receipt["summary"], {expected: 1})
+                self.assertEqual(receipt["entries"], [{"result": expected}])
+
+    def test_unexpected_mirror_failure_retains_partial_entries(self):
+        result, receipt = self.run_case(
+            mirror="failure", prior_lines=[{"image": "first", "result": "MIRRORED_VERIFIED"}]
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(receipt["summary"], {"MIRRORED_VERIFIED": 1, "MIRROR_STEP_FAILED": 1})
+
+    def test_valid_mirror_receipt_is_not_rewritten(self):
+        original = json.dumps({
+            "run": "offline-finalizer-test", "entries": [{"result": "MIRRORED_VERIFIED"}],
+            "summary": {"MIRRORED_VERIFIED": 1},
+        })
+        result, receipt = self.run_case(aggregate=original)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(receipt, json.loads(original))
+
+    def test_missing_or_invalid_success_receipt_fails_closed(self):
+        for aggregate, expected in ((None, "MIRROR_RECEIPT_MISSING"), ("{}", "MIRROR_RECEIPT_INVALID")):
+            with self.subTest(expected=expected):
+                result, receipt = self.run_case(aggregate=aggregate)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(receipt["summary"], {expected: 1})
 
 
 if __name__ == "__main__":
