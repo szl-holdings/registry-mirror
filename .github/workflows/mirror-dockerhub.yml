@@ -125,7 +125,9 @@ jobs:
               if [ "$sdig" = "$ddig" ]; then
                 jq -cn --arg i "$img" --arg t "$t" --arg d "$sdig" '{image:$i, tag:$t, digest:$d, result:"ALREADY_IDENTICAL"}' >> receipt.jsonl; continue
               fi
-              if ./crane copy "$src" "$dst" 2>"$crane_error"; then
+              # Copy the digest just inspected: a mutable source tag can move
+              # between digest lookup and copy while another release publishes.
+              if ./crane copy "$SOURCE_ORG/$img@$sdig" "$dst" 2>"$crane_error"; then
                 if ! ndig="$(./crane digest "$dst" 2>"$crane_error")"; then
                   cat "$crane_error" >&2
                   fail=1

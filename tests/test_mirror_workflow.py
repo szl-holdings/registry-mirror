@@ -21,7 +21,7 @@ with open("crane-calls.jsonl", "a", encoding="utf-8") as log:
     log.write(json.dumps(args) + "\n")
 scenario = os.environ["TEST_SCENARIO"]
 state = Path("copied.json")
-copied = set(json.loads(state.read_text())) if state.exists() else set()
+copied = json.loads(state.read_text()) if state.exists() else {}
 digest = "sha256:" + "a" * 64
 
 def blocked():
@@ -60,7 +60,7 @@ elif args[0] == "digest":
     elif ref in copied:
         if scenario == "blocked_verification":
             blocked()
-        print("sha256:" + "b" * 64 if scenario == "mismatch" else digest)
+        print("sha256:" + "b" * 64 if scenario == "mismatch" else copied[ref])
     else:
         print("Error: MANIFEST_UNKNOWN: tag is absent", file=sys.stderr)
         raise SystemExit(1)
@@ -70,8 +70,11 @@ elif args[0] == "copy":
     if scenario == "transient_copy_failure":
         print("Error: unexpected status code 503 Service Unavailable", file=sys.stderr)
         raise SystemExit(1)
-    copied.add(args[2])
-    state.write_text(json.dumps(sorted(copied)))
+    # A mutable tag can change after the source digest has been inspected.
+    copied[args[2]] = ("sha256:" + "b" * 64
+                       if scenario == "moving_source_tag" and "@" not in args[1]
+                       else digest)
+    state.write_text(json.dumps(copied, sort_keys=True))
 else:
     raise SystemExit("unexpected crane command: " + repr(args))
 '''
@@ -143,7 +146,7 @@ class MirrorContractTests(unittest.TestCase):
         self.assertEqual(receipt["summary"], {"SOURCE_TAG_LIST_FAILED": 1, "MIRRORED_VERIFIED": 2})
         copied = [call for call in calls if call[0] == "copy"]
         self.assertEqual(len(copied), 2)
-        self.assertTrue(all("/second:" in call[1] for call in copied))
+        self.assertTrue(all("/second@sha256:" in call[1] for call in copied))
 
     def test_successful_source_listing_without_release_tags_remains_empty(self):
         result, calls, receipt = self.run_case("no_release_tags")
@@ -175,7 +178,7 @@ class MirrorContractTests(unittest.TestCase):
         self.assertEqual(receipt["summary"], {"SOURCE_DIGEST_FAILED": 1, "MIRRORED_VERIFIED": 3})
         copied = [call for call in calls if call[0] == "copy"]
         self.assertEqual(len(copied), 3)
-        self.assertNotIn("ghcr.io/example/first:latest", [call[1] for call in copied])
+        self.assertNotIn("docker.io/example/first:latest", [call[2] for call in copied])
 
     def test_copy_access_failure_stops_remaining_tags_and_images(self):
         for status in ("401", "403", "429"):
@@ -206,6 +209,16 @@ class MirrorContractTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(receipt["summary"], {"MIRRORED_VERIFIED": 4})
         self.assertEqual({entry["tag"] for entry in receipt["entries"]}, {"latest", "1.0.0"})
+
+    def test_source_tag_movement_copies_the_digest_that_was_observed(self):
+        result, calls, receipt = self.run_case("moving_source_tag")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(receipt["summary"], {"MIRRORED_VERIFIED": 4})
+        sources = {call[1] for call in calls if call[0] == "copy"}
+        self.assertEqual(sources, {
+            "ghcr.io/example/first@sha256:" + "a" * 64,
+            "ghcr.io/example/second@sha256:" + "a" * 64,
+        })
 
     def test_identical_destinations_do_not_copy(self):
         result, calls, receipt = self.run_case("identical")
