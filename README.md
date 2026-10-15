@@ -28,8 +28,10 @@ a discovery surface with byte-identical tags.
 
 ## State
 
-`SETUP_REQUIRED` until the two repository secrets exist. Without them the job logs a warning and exits 0;
-nothing is mirrored and nothing is claimed. Codename images (`rosie`, `sentra`, `amaru`) and
+`SETUP_REQUIRED` until the two repository secrets exist. Without them the job logs a warning, uploads
+a `SETUP_REQUIRED` receipt, and exits 0; nothing is mirrored and nothing is claimed. Tool-install
+and registry-authentication failures also produce sanitized failure receipts before artifact upload.
+Codename images (`rosie`, `sentra`, `amaru`) and
 `bundles-staging/*` are excluded by doctrine.
 
 With credentials installed, a registry authorization failure (401/403) or rate limit (429)

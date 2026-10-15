@@ -39,6 +39,7 @@ jobs:
       packages: read
     steps:
       - name: Harden runner
+        id: harden
         uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: audit
@@ -57,6 +58,7 @@ jobs:
           fi
 
       - name: Install crane (pinned release, checksum verified)
+        id: install
         if: steps.creds.outputs.state == 'READY'
         run: |
           set -euo pipefail
@@ -66,6 +68,7 @@ jobs:
           ./crane version
 
       - name: Authenticate (GHCR read, Docker Hub write)
+        id: auth
         if: steps.creds.outputs.state == 'READY'
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -77,6 +80,7 @@ jobs:
           printf '%s' "$DOCKERHUB_TOKEN" | ./crane auth login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin
 
       - name: Mirror release tags and verify digests
+        id: mirror
         if: steps.creds.outputs.state == 'READY'
         run: |
           set -euo pipefail
@@ -151,13 +155,52 @@ jobs:
           jq -s '{ts:(now|todate), run:env.GITHUB_RUN_ID, source:env.SOURCE_ORG, dest:env.DEST_ORG, entries:., summary:(group_by(.result)|map({(.[0].result):length})|add)}' receipt.jsonl > mirror-receipt.json
           [ "$fail" -eq 0 ] || { echo "::error::one or more copies failed or did not verify"; exit 1; }
 
+      - name: Finalize receipt for setup and preflight failures
+        if: always()
+        env:
+          HARDEN_OUTCOME: ${{ steps.harden.outcome }}
+          CREDS_STATE: ${{ steps.creds.outputs.state }}
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          AUTH_OUTCOME: ${{ steps.auth.outcome }}
+          MIRROR_OUTCOME: ${{ steps.mirror.outcome }}
+        run: |
+          set -euo pipefail
+          if [ -f mirror-receipt.json ] && jq -e '(.entries|type=="array") and (.summary|type=="object") and (.run|type=="string")' mirror-receipt.json >/dev/null; then
+            exit 0
+          fi
+          if [ -f mirror-receipt.json ]; then
+            result=MIRROR_RECEIPT_INVALID
+          elif [ "$HARDEN_OUTCOME" != success ]; then
+            result=HARDEN_RUNNER_FAILED
+          elif [ "$CREDS_STATE" = SETUP_REQUIRED ]; then
+            result=SETUP_REQUIRED
+          elif [ "$CREDS_STATE" != READY ]; then
+            result=CREDENTIAL_CHECK_FAILED
+          elif [ "$INSTALL_OUTCOME" != success ]; then
+            result=CRANE_INSTALL_FAILED
+          elif [ "$AUTH_OUTCOME" != success ]; then
+            result=REGISTRY_AUTH_FAILED
+          elif [ "$MIRROR_OUTCOME" != success ]; then
+            result=MIRROR_STEP_FAILED
+          else
+            result=MIRROR_RECEIPT_MISSING
+          fi
+          if [ ! -f receipt.jsonl ] || ! jq -s . receipt.jsonl >/dev/null 2>&1; then
+            : > receipt.jsonl
+          fi
+          jq -cn --arg result "$result" '{result:$result}' >> receipt.jsonl
+          jq -s '{ts:(now|todate), run:env.GITHUB_RUN_ID, source:env.SOURCE_ORG, dest:env.DEST_ORG, entries:., summary:(group_by(.result)|map({(.[0].result):length})|add)}' receipt.jsonl > mirror-receipt.json
+          if [ "$result" = MIRROR_RECEIPT_INVALID ] || [ "$result" = MIRROR_RECEIPT_MISSING ]; then
+            echo "::error::$result"; exit 1
+          fi
+
       - name: Persist receipt
-        if: always() && steps.creds.outputs.state == 'READY'
+        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dockerhub-mirror-receipt-${{ github.run_id }}
           path: |
             mirror-receipt.json
             receipt.jsonl
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
