@@ -39,6 +39,12 @@ stops the remaining image/tag attempts, retains a failure receipt, and fails the
 prevents repeated bad-login attempts from escalating into a registry lockout. The owner
 must resolve the registry access failure before retrying; the workflow does not rotate or
 alter credentials. Other copy failures and digest mismatches also remain failures.
+Before copying a tag, a failed destination digest lookup permits first-copy only
+when its final error explicitly reports a missing manifest/repository or HTTP 404.
+Only complete recognized crane absence diagnostics qualify; compound or novel
+error formats remain failures even when they contain absence tokens.
+Other lookup failures retain a `DESTINATION_DIGEST_FAILED` receipt and skip that
+tag without writing to its unknown destination state.
 
 The mirror loop contract is tested offline with `python3 -m unittest discover -s tests -v`
 (Python 3, Bash, and `jq` required); no registry credentials or network access are used.

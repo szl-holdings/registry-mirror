@@ -55,6 +55,14 @@ elif args[0] == "digest":
         print(digest)
     elif scenario == "blocked_digest":
         blocked()
+    elif scenario in {"transient_destination_digest", "transport_destination_digest", "mixed_destination_digest"} and ref.endswith("/first:latest"):
+        if scenario == "transport_destination_digest":
+            print("Error: connection reset by peer", file=sys.stderr)
+        else:
+            if scenario == "mixed_destination_digest":
+                print("HEAD request failed, falling back on GET: unexpected status code 404 Not Found", file=sys.stderr)
+            print("Error: unexpected status code 503 Service Unavailable", file=sys.stderr)
+        raise SystemExit(1)
     elif scenario == "identical":
         print(digest)
     elif ref in copied:
@@ -62,7 +70,16 @@ elif args[0] == "digest":
             blocked()
         print("sha256:" + "b" * 64 if scenario == "mismatch" else copied[ref])
     else:
-        print("Error: MANIFEST_UNKNOWN: tag is absent", file=sys.stderr)
+        missing = {
+            "missing_destination_404": "unexpected status code 404 Not Found",
+            "missing_destination_name": "NAME_UNKNOWN: repository is absent",
+            "missing_destination_get": "GET https://index.docker.io/v2/example/image/manifests/latest: unexpected status code 404 Not Found",
+            "missing_destination_manifest": "fetching manifest docker.io/example/image:latest: GET https://index.docker.io/v2/example/image/manifests/latest: MANIFEST_UNKNOWN: manifest unknown; unknown tag=latest",
+            "mixed_503_name": "unexpected status code 503 Service Unavailable: NAME_UNKNOWN: upstream unavailable",
+            "mixed_head_get": "HEAD unexpected status code 404 Not Found; GET request failed: context deadline exceeded",
+            "mixed_500_manifest": "unexpected status code 500 Internal Server Error: MANIFEST_UNKNOWN",
+        }.get(scenario, "MANIFEST_UNKNOWN: tag is absent")
+        print("Error: " + missing, file=sys.stderr)
         raise SystemExit(1)
 elif args[0] == "copy":
     if scenario == "blocked_copy":
@@ -139,6 +156,32 @@ class MirrorContractTests(unittest.TestCase):
                 self.assertEqual(len(receipt["entries"]), 1)
                 self.assertEqual(receipt["entries"][0]["result"], "DESTINATION_ACCESS_BLOCKED")
                 self.assertIn(status, result.stderr)
+
+    def test_unknown_destination_state_fails_without_copying_that_tag(self):
+        for scenario in ("transient_destination_digest", "transport_destination_digest", "mixed_destination_digest"):
+            with self.subTest(scenario=scenario):
+                result, calls, receipt = self.run_case(scenario)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(receipt["summary"], {"DESTINATION_DIGEST_FAILED": 1, "MIRRORED_VERIFIED": 3})
+                copied = [call[2] for call in calls if call[0] == "copy"]
+                self.assertNotIn("docker.io/example/first:latest", copied)
+                self.assertEqual(len(copied), 3)
+
+    def test_explicit_missing_destination_still_allows_first_copy(self):
+        for scenario in ("success", "missing_destination_404", "missing_destination_name", "missing_destination_get", "missing_destination_manifest"):
+            with self.subTest(scenario=scenario):
+                result, calls, receipt = self.run_case(scenario)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(receipt["summary"], {"MIRRORED_VERIFIED": 4})
+                self.assertEqual(len([call for call in calls if call[0] == "copy"]), 4)
+
+    def test_compound_destination_errors_never_permit_copy(self):
+        for scenario in ("mixed_503_name", "mixed_head_get", "mixed_500_manifest"):
+            with self.subTest(scenario=scenario):
+                result, calls, receipt = self.run_case(scenario)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual([call for call in calls if call[0] == "copy"], [])
+                self.assertEqual(receipt["summary"], {"DESTINATION_DIGEST_FAILED": 4})
 
     def test_source_list_access_failure_does_not_claim_empty_or_use_partial_tags(self):
         for status in ("401", "403", "429"):
