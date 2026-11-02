@@ -93,6 +93,13 @@ jobs:
             # failures. Retrying every remaining tag can turn a 401 into a lockout.
             grep -Eiq 'unexpected status code (401|403|429)([^0-9]|$)|(^|[^[:alnum:]_])(UNAUTHORIZED|DENIED|TOOMANYREQUESTS)([^[:alnum:]_]|$)|incorrect username or password|too many failed login attempts' "$crane_error"
           }
+          destination_tag_missing() {
+            # Admit only complete terminal absence diagnostics. Substring matches
+            # can mistake a HEAD 404 followed by a failed GET, or a 503 body
+            # containing NAME_UNKNOWN, for an absent destination. New or compound
+            # crane error formats stay failures until explicitly reviewed.
+            tail -n 1 "$crane_error" | grep -Eq '^Error: (fetching manifest [^[:space:]]+: )?(GET https?://[^[:space:]]+: )?(unexpected status code 404 Not Found|MANIFEST_UNKNOWN: (manifest unknown|tag is absent)(; unknown tag=[^[:space:];]+)?|NAME_UNKNOWN: (repository name not known to registry|repository is absent)(; name=[^[:space:];]+)?)$'
+          }
           for img in $IMAGES; do
             # A failed listing is not proof that a source has no release tags.
             # Discard even partial stdout until the complete listing succeeds.
@@ -122,6 +129,12 @@ jobs:
                   fail=1
                   jq -cn --arg i "$img" --arg t "$t" '{image:$i, tag:$t, result:"DESTINATION_ACCESS_BLOCKED"}' >> receipt.jsonl
                   break 2
+                fi
+                if ! destination_tag_missing; then
+                  cat "$crane_error" >&2
+                  fail=1
+                  jq -cn --arg i "$img" --arg t "$t" '{image:$i, tag:$t, result:"DESTINATION_DIGEST_FAILED"}' >> receipt.jsonl
+                  continue
                 fi
                 # A destination tag that does not exist yet still needs its first copy.
                 ddig=""
