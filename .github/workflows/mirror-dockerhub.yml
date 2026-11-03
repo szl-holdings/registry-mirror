@@ -8,6 +8,10 @@ name: Mirror GHCR images to Docker Hub
 # Fail-closed / honest:
 #   * If DOCKERHUB_USERNAME / DOCKERHUB_TOKEN are not installed as repository secrets the
 #     job prints SETUP_REQUIRED and exits 0 (least privilege: the Docker Hub token is visible only to this one-purpose repository) — nothing is mirrored and nothing is claimed.
+#   * Installed Docker Hub credentials are proven with exactly one token request (pull,push on
+#     one destination repository) before any mirroring: 401 -> REGISTRY_AUTH_FAILED,
+#     429 -> REGISTRY_AUTH_LOCKED_OUT, anything else without a token -> REGISTRY_AUTH_UNVERIFIED.
+#     Each stops the job before the mirror loop, so a bad pair cannot escalate into a lockout.
 #   * Every copy is verified by comparing source and destination digests; a mismatch
 #     fails the run. A receipt artifact lists image, tag, digests and result.
 #   * Only `latest` and release-looking tags (x.y.z, vx.y.z, uds-vx.y.z) are mirrored.
@@ -76,12 +80,96 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          set +x  # never trace this step: it handles registry credentials
           printf '%s' "$GHCR_TOKEN" | ./crane auth login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+          # Stored-secret defects are invisible after `gh secret set`. Report them by
+          # category only; never print, trim or otherwise alter either value.
+          LC_ALL=C  # byte-wise character classes: non-ASCII bytes are never [:graph:]
+          defects=()
+          inspect_secret() {
+            local name="$1" value="$2" trimmed rest
+            trimmed="${value#"${value%%[![:space:]]*}"}"
+            trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+            case "$value" in [[:space:]]*|*[[:space:]]) defects+=("${name}_LEADING_OR_TRAILING_WHITESPACE") ;; esac
+            case "$trimmed" in *[[:space:]]*) defects+=("${name}_EMBEDDED_WHITESPACE") ;; esac
+            case "$trimmed" in \"*|*\"|\'*|*\') defects+=("${name}_SURROUNDING_QUOTES") ;; esac
+            case "$trimmed" in *[![:graph:][:space:]]*) defects+=("${name}_NON_ASCII_OR_CONTROL_CHARACTERS") ;; esac
+            if [ "$name" = USERNAME ]; then
+              case "$trimmed" in *@*) defects+=(USERNAME_LOOKS_LIKE_EMAIL) ;; esac
+              case "$trimmed" in dckr_pat_*|dckr_oat_*) defects+=(USERNAME_LOOKS_LIKE_ACCESS_TOKEN) ;; esac
+              rest="${trimmed//[[:space:]@\"\']/}"
+              rest="${rest//[![:graph:]]/}"
+              case "$rest" in *[!A-Za-z0-9._-]*) defects+=(USERNAME_UNEXPECTED_CHARACTERS) ;; esac
+            fi
+          }
+          inspect_secret USERNAME "$DOCKERHUB_USERNAME"
+          inspect_secret TOKEN "$DOCKERHUB_TOKEN"
+          for defect in "${defects[@]}"; do
+            echo "::warning title=DOCKERHUB_SECRET_DEFECT::$defect (category only; the secret value is not shown)"
+          done
+
+          # `crane auth login` only writes ~/.docker/config.json and makes no network call,
+          # so a rejected pair used to pass here and then fail every registry request in the
+          # mirror loop until Docker Hub locked the account (429). Spend exactly one real
+          # token request (no retries, no redirects) and stop here unless it yields a token.
+          case "$DEST_ORG" in
+            docker.io/?*) ;;
+            *) echo "::error title=REGISTRY_AUTH_UNVERIFIED::DEST_ORG is not a docker.io namespace; Docker Hub credentials were not checked."
+               echo "state=REGISTRY_AUTH_UNVERIFIED" >> "$GITHUB_OUTPUT"; exit 1 ;;
+          esac
+          scope="repository:${DEST_ORG#docker.io/}/${IMAGES%% *}:pull,push"
+          token_body="$(mktemp)"
+          trap 'rm -f "$token_body"' EXIT
+          # The Authorization header reaches curl on stdin, so neither secret is in argv.
+          http_status="$(
+            {
+              printf 'Authorization: Basic '
+              printf '%s:%s' "$DOCKERHUB_USERNAME" "$DOCKERHUB_TOKEN" | base64 | tr -d '\n'
+              printf '\n'
+            } | curl --silent --show-error --proto '=https' --tlsv1.2 --max-time 30 \
+                  --get --data-urlencode 'service=registry.docker.io' --data-urlencode "scope=$scope" \
+                  --header @- --output "$token_body" --write-out '%{http_code}' \
+                  'https://auth.docker.io/token'
+          )" || true
+          [[ "$http_status" =~ ^[0-9]{3}$ ]] || http_status=000
+          case "$http_status" in
+            200)
+              if jq -e '(.token // .access_token) | type == "string" and length > 0' "$token_body" >/dev/null 2>&1; then
+                state=REGISTRY_AUTH_VERIFIED
+              else
+                state=REGISTRY_AUTH_UNVERIFIED
+              fi ;;
+            401) state=REGISTRY_AUTH_FAILED ;;
+            429) state=REGISTRY_AUTH_LOCKED_OUT ;;
+            *) state=REGISTRY_AUTH_UNVERIFIED ;;
+          esac
+          {
+            echo "state=$state"
+            echo "http_status=$http_status"
+            echo "secret_defects=$(IFS=,; printf '%s' "${defects[*]}")"
+          } >> "$GITHUB_OUTPUT"
+          echo "Docker Hub credential check: 1 token request for $scope -> HTTP $http_status ($state)"
+
+          if [ "$state" != REGISTRY_AUTH_VERIFIED ]; then
+            if [ "$http_status" != 200 ]; then
+              detail="$(jq -r '(.details // .message // empty) | strings' "$token_body" 2>/dev/null | head -c 200 | tr -cd '[:print:]')" || true
+              [ -z "${detail:-}" ] || echo "Docker Hub said: $detail"
+            fi
+            case "$state" in
+              REGISTRY_AUTH_FAILED) why="Docker Hub rejected the stored DOCKERHUB_USERNAME/DOCKERHUB_TOKEN pair (HTTP 401). The owner must rotate both secrets (README: Owner step)." ;;
+              REGISTRY_AUTH_LOCKED_OUT) why="Docker Hub is refusing logins for this account (HTTP 429, too many failed login attempts). Do not re-run until the lockout clears; rotate the secrets if they were wrong." ;;
+              *) why="The Docker Hub token request did not return a token (HTTP $http_status; 000 = no response). The credentials are neither confirmed nor rejected." ;;
+            esac
+            [ "${#defects[@]}" -eq 0 ] || why="$why Secret defects detected: $(IFS=,; printf '%s' "${defects[*]}")."
+            echo "::error title=$state::$why Mirroring was not attempted, so no further Docker Hub logins were spent."
+            exit 1
+          fi
           printf '%s' "$DOCKERHUB_TOKEN" | ./crane auth login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin
 
       - name: Mirror release tags and verify digests
         id: mirror
-        if: steps.creds.outputs.state == 'READY'
+        if: steps.creds.outputs.state == 'READY' && steps.auth.outputs.state == 'REGISTRY_AUTH_VERIFIED'
         run: |
           set -euo pipefail
           : > receipt.jsonl
@@ -175,12 +263,16 @@ jobs:
           CREDS_STATE: ${{ steps.creds.outputs.state }}
           INSTALL_OUTCOME: ${{ steps.install.outcome }}
           AUTH_OUTCOME: ${{ steps.auth.outcome }}
+          AUTH_STATE: ${{ steps.auth.outputs.state }}
+          AUTH_HTTP_STATUS: ${{ steps.auth.outputs.http_status }}
+          AUTH_SECRET_DEFECTS: ${{ steps.auth.outputs.secret_defects }}
           MIRROR_OUTCOME: ${{ steps.mirror.outcome }}
         run: |
           set -euo pipefail
           if [ -f mirror-receipt.json ] && jq -e '(.entries|type=="array") and (.summary|type=="object") and (.run|type=="string")' mirror-receipt.json >/dev/null; then
             exit 0
           fi
+          detail='{}'
           if [ -f mirror-receipt.json ]; then
             result=MIRROR_RECEIPT_INVALID
           elif [ "$HARDEN_OUTCOME" != success ]; then
@@ -192,7 +284,17 @@ jobs:
           elif [ "$INSTALL_OUTCOME" != success ]; then
             result=CRANE_INSTALL_FAILED
           elif [ "$AUTH_OUTCOME" != success ]; then
-            result=REGISTRY_AUTH_FAILED
+            # REGISTRY_AUTH_FAILED is reserved for an observed 401. An auth step that
+            # failed without a classification has not verified the credentials.
+            case "${AUTH_STATE:-}" in
+              REGISTRY_AUTH_FAILED|REGISTRY_AUTH_LOCKED_OUT|REGISTRY_AUTH_UNVERIFIED) result="$AUTH_STATE" ;;
+              *) result=REGISTRY_AUTH_UNVERIFIED ;;
+            esac
+            # Categories and status code only; the auth step never exposes secret values.
+            detail="$(jq -cn --arg state "${AUTH_STATE:-}" --arg status "${AUTH_HTTP_STATUS:-}" --arg defects "${AUTH_SECRET_DEFECTS:-}" '
+              (if $state == "" then {} else {registry:"docker.io"} end)
+              + (if ($status|test("^[1-5][0-9][0-9]$")) then {http_status:($status|tonumber)} else {} end)
+              + (if $defects == "" then {} else {secret_defects:($defects|split(",")|map(select(test("^[A-Z_]+$"))))} end)')"
           elif [ "$MIRROR_OUTCOME" != success ]; then
             result=MIRROR_STEP_FAILED
           else
@@ -201,7 +303,7 @@ jobs:
           if [ ! -f receipt.jsonl ] || ! jq -s . receipt.jsonl >/dev/null 2>&1; then
             : > receipt.jsonl
           fi
-          jq -cn --arg result "$result" '{result:$result}' >> receipt.jsonl
+          jq -cn --arg result "$result" --argjson detail "$detail" '$detail + {result:$result}' >> receipt.jsonl
           jq -s '{ts:(now|todate), run:env.GITHUB_RUN_ID, source:env.SOURCE_ORG, dest:env.DEST_ORG, entries:., summary:(group_by(.result)|map({(.[0].result):length})|add)}' receipt.jsonl > mirror-receipt.json
           if [ "$result" = MIRROR_RECEIPT_INVALID ] || [ "$result" = MIRROR_RECEIPT_MISSING ]; then
             echo "::error::$result"; exit 1

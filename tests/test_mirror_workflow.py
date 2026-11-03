@@ -1,5 +1,6 @@
 """Exercise the workflow's real mirror loop without accessing either registry."""
 
+import base64
 import json
 import os
 from pathlib import Path
@@ -96,21 +97,66 @@ else:
     raise SystemExit("unexpected crane command: " + repr(args))
 '''
 
+# Stand-ins for the Authenticate step: they record argv and stdin so tests can prove
+# that exactly one token request is made and that secrets never appear in argv.
+FAKE_AUTH_CRANE = r'''#!/usr/bin/env python3
+import json
+import sys
+
+args = sys.argv[1:]
+with open("crane-calls.jsonl", "a", encoding="utf-8") as log:
+    log.write(json.dumps({"args": args, "stdin": sys.stdin.read()}) + "\n")
+if args[:2] != ["auth", "login"]:
+    raise SystemExit("unexpected crane command: " + repr(args))
+'''
+FAKE_CURL = r'''#!/usr/bin/env python3
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+with open("curl-calls.jsonl", "a", encoding="utf-8") as log:
+    log.write(json.dumps({"args": args, "stdin": sys.stdin.read()}) + "\n")
+scenario = os.environ["TEST_HTTP"]
+body = {
+    "200": '{"token":"fake-bearer","access_token":"fake-bearer","expires_in":300}',
+    "200-no-token": '{"expires_in":300}',
+    "401": '{"details":"incorrect username or password"}',
+    "429": '{"details":"too many failed login attempts for username or IP address"}',
+    "403": '{"details":"access denied"}',
+    "503": "<html>service unavailable</html>",
+}.get(scenario, "")
+with open(args[args.index("--output") + 1], "w", encoding="utf-8") as out:
+    out.write(body)
+if scenario == "000":
+    sys.stdout.write("000")
+    print("curl: (28) Operation timed out after 30000 milliseconds", file=sys.stderr)
+    raise SystemExit(28)
+sys.stdout.write(scenario.split("-")[0])
+'''
+
+
+def step_script(name):
+    """Read one step's inline run script from the workflow."""
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    step = workflow.split("      - name: " + name + "\n", 1)[1]
+    body = step.split("        run: |\n", 1)[1].split("\n      - name:", 1)[0]
+    return textwrap.dedent(body)
+
+
+def auth_script():
+    """Read the actual credential check from the workflow."""
+    return step_script("Authenticate (GHCR read, Docker Hub write)")
+
 
 def mirror_script():
     """Read the inline job rather than maintaining a separate test implementation."""
-    workflow = WORKFLOW.read_text(encoding="utf-8")
-    step = workflow.split("      - name: Mirror release tags and verify digests\n", 1)[1]
-    body = step.split("        run: |\n", 1)[1].split("\n      - name:", 1)[0]
-    return textwrap.dedent(body)
+    return step_script("Mirror release tags and verify digests")
 
 
 def finalize_script():
     """Read the actual receipt finalizer from the workflow."""
-    workflow = WORKFLOW.read_text(encoding="utf-8")
-    step = workflow.split("      - name: Finalize receipt for setup and preflight failures\n", 1)[1]
-    body = step.split("        run: |\n", 1)[1].split("\n      - name:", 1)[0]
-    return textwrap.dedent(body)
+    return step_script("Finalize receipt for setup and preflight failures")
 
 
 class MirrorContractTests(unittest.TestCase):
@@ -286,7 +332,8 @@ class MirrorContractTests(unittest.TestCase):
 
 class ReceiptFinalizerTests(unittest.TestCase):
     def run_case(self, *, harden="success", creds="READY", install="success",
-                 auth="success", mirror="success", prior_lines=None, aggregate=None):
+                 auth="success", mirror="success", prior_lines=None, aggregate=None,
+                 auth_state="", auth_http_status="", auth_secret_defects=""):
         with tempfile.TemporaryDirectory() as directory:
             cwd = Path(directory)
             if prior_lines is not None:
@@ -305,6 +352,9 @@ class ReceiptFinalizerTests(unittest.TestCase):
                     "CREDS_STATE": creds,
                     "INSTALL_OUTCOME": install,
                     "AUTH_OUTCOME": auth,
+                    "AUTH_STATE": auth_state,
+                    "AUTH_HTTP_STATUS": auth_http_status,
+                    "AUTH_SECRET_DEFECTS": auth_secret_defects,
                     "MIRROR_OUTCOME": mirror,
                     "GITHUB_RUN_ID": "offline-finalizer-test",
                     "SOURCE_ORG": "ghcr.io/example",
@@ -324,7 +374,9 @@ class ReceiptFinalizerTests(unittest.TestCase):
             ({"creds": "SETUP_REQUIRED", "install": "skipped", "auth": "skipped", "mirror": "skipped"}, "SETUP_REQUIRED"),
             ({"creds": "", "install": "skipped", "auth": "skipped", "mirror": "skipped"}, "CREDENTIAL_CHECK_FAILED"),
             ({"install": "failure", "auth": "skipped", "mirror": "skipped"}, "CRANE_INSTALL_FAILED"),
-            ({"auth": "failure", "mirror": "skipped"}, "REGISTRY_AUTH_FAILED"),
+            # An auth step that failed before classifying Docker Hub's answer has not
+            # verified anything; REGISTRY_AUTH_FAILED is reserved for an observed 401.
+            ({"auth": "failure", "mirror": "skipped"}, "REGISTRY_AUTH_UNVERIFIED"),
         )
         for settings, expected in cases:
             with self.subTest(expected=expected):
@@ -332,6 +384,29 @@ class ReceiptFinalizerTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(receipt["summary"], {expected: 1})
                 self.assertEqual(receipt["entries"], [{"result": expected}])
+
+    def test_classified_docker_hub_auth_failures_are_receipted(self):
+        cases = (
+            ("REGISTRY_AUTH_FAILED", "401", "", {"registry": "docker.io", "http_status": 401}),
+            ("REGISTRY_AUTH_LOCKED_OUT", "429", "USERNAME_LOOKS_LIKE_EMAIL,TOKEN_LEADING_OR_TRAILING_WHITESPACE",
+             {"registry": "docker.io", "http_status": 429,
+              "secret_defects": ["USERNAME_LOOKS_LIKE_EMAIL", "TOKEN_LEADING_OR_TRAILING_WHITESPACE"]}),
+            ("REGISTRY_AUTH_UNVERIFIED", "503", "", {"registry": "docker.io", "http_status": 503}),
+            # 000: no HTTP response, so no status code is claimed.
+            ("REGISTRY_AUTH_UNVERIFIED", "000", "", {"registry": "docker.io"}),
+            # Only known classifications pass through; anything else is unverified.
+            ("SOMETHING_ELSE", "", "", {"registry": "docker.io"}),
+        )
+        for state, status, defects, detail in cases:
+            with self.subTest(state=state, status=status):
+                result, receipt = self.run_case(
+                    auth="failure", mirror="skipped", auth_state=state,
+                    auth_http_status=status, auth_secret_defects=defects,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                expected = state if state.startswith("REGISTRY_AUTH_") else "REGISTRY_AUTH_UNVERIFIED"
+                self.assertEqual(receipt["summary"], {expected: 1})
+                self.assertEqual(receipt["entries"], [dict(detail, result=expected)])
 
     def test_unexpected_mirror_failure_retains_partial_entries(self):
         result, receipt = self.run_case(
@@ -355,6 +430,150 @@ class ReceiptFinalizerTests(unittest.TestCase):
                 result, receipt = self.run_case(aggregate=aggregate)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(receipt["summary"], {expected: 1})
+
+
+class DockerHubCredentialCheckTests(unittest.TestCase):
+    USERNAME = "szlmirrorbot"
+    TOKEN = "dckr_pat_" + "Q" * 27
+
+    def run_case(self, http, username=USERNAME, token=TOKEN):
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            bin_dir = cwd / "bin"
+            bin_dir.mkdir()
+            for path, source in ((cwd / "crane", FAKE_AUTH_CRANE), (bin_dir / "curl", FAKE_CURL)):
+                path.write_bytes(source.encode("utf-8"))
+                path.chmod(0o755)
+            output = cwd / "github-output"
+            result = subprocess.run(
+                [os.environ.get("BASH", "bash"), "-c", auth_script()],
+                cwd=cwd,
+                env={
+                    "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+                    "TEST_HTTP": http,
+                    "DOCKERHUB_USERNAME": username,
+                    "DOCKERHUB_TOKEN": token,
+                    "GHCR_TOKEN": "ghcr-token-value",
+                    "GITHUB_ACTOR": "octocat",
+                    "GITHUB_OUTPUT": str(output),
+                    "DEST_ORG": "docker.io/example",
+                    "IMAGES": "first second",
+                },
+                text=True,
+                capture_output=True,
+                timeout=20,
+            )
+            outputs = dict(
+                line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines()
+            ) if output.exists() else {}
+
+            def calls(name):
+                path = cwd / name
+                if not path.exists():
+                    return []
+                return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+            return result, outputs, calls("curl-calls.jsonl"), calls("crane-calls.jsonl")
+
+    def assert_secrets_not_exposed(self, result, curl_calls, crane_calls, username, token):
+        logs = result.stdout + result.stderr
+        basic = base64.b64encode((username + ":" + token).encode("utf-8")).decode("ascii")
+        for secret in (token, token.strip(), basic):
+            self.assertNotIn(secret, logs)
+            for call in curl_calls + crane_calls:
+                self.assertFalse(any(secret in arg for arg in call["args"]))
+        if "@" in username or username != username.strip():
+            self.assertNotIn(username.strip(), logs)
+
+    def test_rejected_or_unverified_credentials_stop_after_one_token_request(self):
+        cases = (
+            ("401", "REGISTRY_AUTH_FAILED", "401"),
+            ("429", "REGISTRY_AUTH_LOCKED_OUT", "429"),
+            ("403", "REGISTRY_AUTH_UNVERIFIED", "403"),
+            ("503", "REGISTRY_AUTH_UNVERIFIED", "503"),
+            ("000", "REGISTRY_AUTH_UNVERIFIED", "000"),
+            ("200-no-token", "REGISTRY_AUTH_UNVERIFIED", "200"),
+        )
+        for http, state, status in cases:
+            with self.subTest(http=http):
+                result, outputs, curl_calls, crane_calls = self.run_case(http)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(outputs["state"], state)
+                self.assertEqual(outputs["http_status"], status)
+                self.assertEqual(outputs["secret_defects"], "")
+                self.assertEqual(len(curl_calls), 1)
+                self.assertIn("::error title=" + state + "::", result.stdout)
+                # Docker Hub credentials are never written for the mirror loop to reuse.
+                self.assertEqual([call["args"][2] for call in crane_calls], ["ghcr.io"])
+                self.assert_secrets_not_exposed(result, curl_calls, crane_calls, self.USERNAME, self.TOKEN)
+
+    def test_verified_credentials_are_configured_once(self):
+        result, outputs, curl_calls, crane_calls = self.run_case("200")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(outputs, {
+            "state": "REGISTRY_AUTH_VERIFIED", "http_status": "200", "secret_defects": "",
+        })
+        self.assertEqual(len(curl_calls), 1)
+        self.assertEqual([call["args"] for call in crane_calls], [
+            ["auth", "login", "ghcr.io", "-u", "octocat", "--password-stdin"],
+            ["auth", "login", "docker.io", "-u", self.USERNAME, "--password-stdin"],
+        ])
+        self.assertEqual(crane_calls[1]["stdin"], self.TOKEN)
+        self.assertNotIn("fake-bearer", result.stdout + result.stderr)
+        self.assert_secrets_not_exposed(result, curl_calls, crane_calls, self.USERNAME, self.TOKEN)
+
+    def test_token_request_is_single_scoped_and_reads_credentials_from_stdin(self):
+        result, outputs, curl_calls, crane_calls = self.run_case("401")
+        (call,) = curl_calls
+        args = call["args"]
+        self.assertEqual(args[-1], "https://auth.docker.io/token")
+        self.assertIn("service=registry.docker.io", args)
+        self.assertIn("scope=repository:example/first:pull,push", args)
+        self.assertEqual(args[args.index("--header") + 1], "@-")
+        self.assertEqual(args[args.index("--proto") + 1], "=https")
+        for flag in ("--retry", "--location", "-L", "--user", "-u", "--netrc"):
+            self.assertNotIn(flag, args)
+        basic = base64.b64encode((self.USERNAME + ":" + self.TOKEN).encode("utf-8")).decode("ascii")
+        self.assertEqual(call["stdin"], "Authorization: Basic " + basic + "\n")
+
+    def test_secret_defects_are_reported_by_category_only(self):
+        USERNAME, TOKEN = self.USERNAME, self.TOKEN
+        cases = (
+            ("someone@example.com", TOKEN + "\n",
+             ["USERNAME_LOOKS_LIKE_EMAIL", "TOKEN_LEADING_OR_TRAILING_WHITESPACE"]),
+            (USERNAME + "\r\n", TOKEN, ["USERNAME_LEADING_OR_TRAILING_WHITESPACE"]),
+            (" " + USERNAME, '"' + TOKEN + '"',
+             ["USERNAME_LEADING_OR_TRAILING_WHITESPACE", "TOKEN_SURROUNDING_QUOTES"]),
+            ("<docker hub username>", TOKEN,
+             ["USERNAME_EMBEDDED_WHITESPACE", "USERNAME_UNEXPECTED_CHARACTERS"]),
+            ("docker.io/" + USERNAME, TOKEN, ["USERNAME_UNEXPECTED_CHARACTERS"]),
+            (TOKEN, USERNAME, ["USERNAME_LOOKS_LIKE_ACCESS_TOKEN"]),
+            (USERNAME, "\ufeff" + TOKEN, ["TOKEN_NON_ASCII_OR_CONTROL_CHARACTERS"]),
+            (USERNAME, TOKEN[:12] + " " + TOKEN[12:], ["TOKEN_EMBEDDED_WHITESPACE"]),
+        )
+        for username, token, expected in cases:
+            with self.subTest(expected=expected):
+                result, outputs, curl_calls, crane_calls = self.run_case("401", username, token)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(outputs["state"], "REGISTRY_AUTH_FAILED")
+                self.assertEqual(outputs["secret_defects"].split(","), expected)
+                self.assertEqual(len(curl_calls), 1)
+                for defect in expected:
+                    self.assertIn("::warning title=DOCKERHUB_SECRET_DEFECT::" + defect, result.stdout)
+                self.assert_secrets_not_exposed(result, curl_calls, crane_calls, username, token)
+
+    def test_defects_do_not_block_credentials_docker_hub_accepts(self):
+        result, outputs, curl_calls, _ = self.run_case("200", self.USERNAME + "\n", self.TOKEN)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(outputs["state"], "REGISTRY_AUTH_VERIFIED")
+        self.assertEqual(outputs["secret_defects"], "USERNAME_LEADING_OR_TRAILING_WHITESPACE")
+        self.assertEqual(len(curl_calls), 1)
+
+    def test_mirror_loop_requires_verified_docker_hub_credentials(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        step = workflow.split("      - name: Mirror release tags and verify digests\n", 1)[1]
+        condition = step.split("        if: ", 1)[1].split("\n", 1)[0]
+        self.assertIn("steps.auth.outputs.state == 'REGISTRY_AUTH_VERIFIED'", condition)
 
 
 if __name__ == "__main__":
