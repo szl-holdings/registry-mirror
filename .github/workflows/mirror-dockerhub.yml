@@ -11,8 +11,8 @@ name: Mirror GHCR images to Docker Hub
 #   * Installed Docker Hub credentials are proven with exactly one token request (pull,push on
 #     one destination repository) before any mirroring: 401 -> REGISTRY_AUTH_FAILED,
 #     429 -> REGISTRY_AUTH_LOCKED_OUT, anything else without a token -> REGISTRY_AUTH_UNVERIFIED.
-#     Each stops mirroring before the loop (no lockout escalation). Owner-blocked auth
-#     states soft-exit 0 with a MEASURED warning + receipt — never claim a successful mirror.
+#     Each hard-fails the job before the mirror loop (no lockout escalation). Auth failure
+#     is never a green check: REGISTRY_AUTH_FAILED / LOCKED_OUT / UNVERIFIED → job red + receipt.
 #   * Every copy is verified by comparing source and destination digests; a mismatch
 #     fails the run. A receipt artifact lists image, tag, digests and result.
 #   * Only `latest` and release-looking tags (x.y.z, vx.y.z, uds-vx.y.z) are mirrored.
@@ -160,9 +160,8 @@ jobs:
               *) why="The Docker Hub token request did not return a token (HTTP $http_status; 000 = no response). The credentials are neither confirmed nor rejected." ;;
             esac
             [ "${#defects[@]}" -eq 0 ] || why="$why Secret defects detected: $(IFS=,; printf '%s' "${defects[*]}")."
-            # Owner/provider credential states are MEASURED-failed, not workflow bugs.
-            echo "::warning title=$state::$why Mirroring was not attempted, so no further Docker Hub logins were spent."
-            exit 0
+            echo "::error title=$state::$why Mirroring was not attempted, so no further Docker Hub logins were spent."
+            exit 1
           fi
           printf '%s' "$DOCKERHUB_TOKEN" | ./crane auth login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin
 
@@ -282,13 +281,9 @@ jobs:
             result=CREDENTIAL_CHECK_FAILED
           elif [ "$INSTALL_OUTCOME" != success ]; then
             result=CRANE_INSTALL_FAILED
-          elif [ "$AUTH_OUTCOME" != success ] || {
-               [ "${AUTH_STATE:-}" = REGISTRY_AUTH_FAILED ] ||
-               [ "${AUTH_STATE:-}" = REGISTRY_AUTH_LOCKED_OUT ] ||
-               [ "${AUTH_STATE:-}" = REGISTRY_AUTH_UNVERIFIED ]
-             }; then
-            # Owner-blocked auth soft-exits 0 but still emits AUTH_STATE. Classify
-            # from that state; REGISTRY_AUTH_FAILED remains reserved for observed 401.
+          elif [ "$AUTH_OUTCOME" != success ]; then
+            # REGISTRY_AUTH_FAILED is reserved for an observed 401. An auth step that
+            # failed without a classification has not verified the credentials.
             case "${AUTH_STATE:-}" in
               REGISTRY_AUTH_FAILED|REGISTRY_AUTH_LOCKED_OUT|REGISTRY_AUTH_UNVERIFIED) result="$AUTH_STATE" ;;
               *) result=REGISTRY_AUTH_UNVERIFIED ;;
@@ -308,9 +303,11 @@ jobs:
           fi
           jq -cn --arg result "$result" --argjson detail "$detail" '$detail + {result:$result}' >> receipt.jsonl
           jq -s '{ts:(now|todate), run:env.GITHUB_RUN_ID, source:env.SOURCE_ORG, dest:env.DEST_ORG, entries:., summary:(group_by(.result)|map({(.[0].result):length})|add)}' receipt.jsonl > mirror-receipt.json
-          if [ "$result" = MIRROR_RECEIPT_INVALID ] || [ "$result" = MIRROR_RECEIPT_MISSING ]; then
-            echo "::error::$result"; exit 1
-          fi
+          case "$result" in
+            MIRROR_RECEIPT_INVALID|MIRROR_RECEIPT_MISSING|REGISTRY_AUTH_FAILED|REGISTRY_AUTH_LOCKED_OUT|REGISTRY_AUTH_UNVERIFIED|CREDENTIAL_CHECK_FAILED|CRANE_INSTALL_FAILED|HARDEN_RUNNER_FAILED|MIRROR_STEP_FAILED)
+              echo "::error::$result"; exit 1
+              ;;
+          esac
 
       - name: Persist receipt
         if: always()
