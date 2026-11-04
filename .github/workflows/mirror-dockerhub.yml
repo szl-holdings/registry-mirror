@@ -152,10 +152,7 @@ jobs:
           echo "Docker Hub credential check: 1 token request for $scope -> HTTP $http_status ($state)"
 
           if [ "$state" != REGISTRY_AUTH_VERIFIED ]; then
-            if [ "$http_status" != 200 ]; then
-              detail="$(jq -r '(.details // .message // empty) | strings' "$token_body" 2>/dev/null | head -c 200 | tr -cd '[:print:]')" || true
-              [ -z "${detail:-}" ] || echo "Docker Hub said: $detail"
-            fi
+            # Do not log provider-controlled bodies: they may echo credentials.
             case "$state" in
               REGISTRY_AUTH_FAILED) why="Docker Hub rejected the stored DOCKERHUB_USERNAME/DOCKERHUB_TOKEN pair (HTTP 401). The owner must rotate both secrets (README: Owner step)." ;;
               REGISTRY_AUTH_LOCKED_OUT) why="Docker Hub is refusing logins for this account (HTTP 429, too many failed login attempts). Do not re-run until the lockout clears; rotate the secrets if they were wrong." ;;
@@ -319,3 +316,4 @@ jobs:
             receipt.jsonl
           if-no-files-found: error
           retention-days: 90
+

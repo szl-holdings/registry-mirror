@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/mirror-dockerhub.yml"
@@ -507,6 +508,35 @@ class DockerHubCredentialCheckTests(unittest.TestCase):
                 self.assertEqual([call["args"][2] for call in crane_calls], ["ghcr.io"])
                 self.assert_secrets_not_exposed(result, curl_calls, crane_calls, self.USERNAME, self.TOKEN)
 
+    def test_provider_error_bodies_are_never_logged(self):
+        # All data is synthetic. Simulate a provider echo of the submitted token
+        # and a marker that GitHub secret masking would not know to redact.
+        marker = "provider-body-must-not-be-logged"
+        for field in ("details", "message"):
+            for http, state in (("401", "REGISTRY_AUTH_FAILED"),
+                                ("429", "REGISTRY_AUTH_LOCKED_OUT"),
+                                ("403", "REGISTRY_AUTH_UNVERIFIED"),
+                                ("503", "REGISTRY_AUTH_UNVERIFIED")):
+                with self.subTest(field=field, http=http):
+                    fake = FAKE_CURL.replace(
+                        'with open(args[args.index("--output") + 1]',
+                        "body = json.dumps({" + repr(field) +
+                        ": " + repr(marker + ": ") +
+                        ' + os.environ["DOCKERHUB_TOKEN"]})\n' +
+                        'with open(args[args.index("--output") + 1]',
+                    )
+                    with mock.patch(__name__ + ".FAKE_CURL", fake):
+                        result, outputs, curl_calls, crane_calls = self.run_case(http)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(outputs["state"], state)
+                    self.assertEqual(outputs["http_status"], http)
+                    self.assertEqual(len(curl_calls), 1)
+                    self.assertEqual([c["args"][2] for c in crane_calls], ["ghcr.io"])
+                    self.assertNotIn(marker, result.stdout + result.stderr)
+                    self.assert_secrets_not_exposed(
+                        result, curl_calls, crane_calls, self.USERNAME, self.TOKEN
+                    )
+
     def test_verified_credentials_are_configured_once(self):
         result, outputs, curl_calls, crane_calls = self.run_case("200")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -578,3 +608,4 @@ class DockerHubCredentialCheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
