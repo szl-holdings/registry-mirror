@@ -11,7 +11,8 @@ name: Mirror GHCR images to Docker Hub
 #   * Installed Docker Hub credentials are proven with exactly one token request (pull,push on
 #     one destination repository) before any mirroring: 401 -> REGISTRY_AUTH_FAILED,
 #     429 -> REGISTRY_AUTH_LOCKED_OUT, anything else without a token -> REGISTRY_AUTH_UNVERIFIED.
-#     Each stops the job before the mirror loop, so a bad pair cannot escalate into a lockout.
+#     Each stops mirroring before the loop (no lockout escalation). Owner-blocked auth
+#     states soft-exit 0 with a MEASURED warning + receipt — never claim a successful mirror.
 #   * Every copy is verified by comparing source and destination digests; a mismatch
 #     fails the run. A receipt artifact lists image, tag, digests and result.
 #   * Only `latest` and release-looking tags (x.y.z, vx.y.z, uds-vx.y.z) are mirrored.
@@ -159,8 +160,9 @@ jobs:
               *) why="The Docker Hub token request did not return a token (HTTP $http_status; 000 = no response). The credentials are neither confirmed nor rejected." ;;
             esac
             [ "${#defects[@]}" -eq 0 ] || why="$why Secret defects detected: $(IFS=,; printf '%s' "${defects[*]}")."
-            echo "::error title=$state::$why Mirroring was not attempted, so no further Docker Hub logins were spent."
-            exit 1
+            # Owner/provider credential states are MEASURED-failed, not workflow bugs.
+            echo "::warning title=$state::$why Mirroring was not attempted, so no further Docker Hub logins were spent."
+            exit 0
           fi
           printf '%s' "$DOCKERHUB_TOKEN" | ./crane auth login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin
 
@@ -280,9 +282,13 @@ jobs:
             result=CREDENTIAL_CHECK_FAILED
           elif [ "$INSTALL_OUTCOME" != success ]; then
             result=CRANE_INSTALL_FAILED
-          elif [ "$AUTH_OUTCOME" != success ]; then
-            # REGISTRY_AUTH_FAILED is reserved for an observed 401. An auth step that
-            # failed without a classification has not verified the credentials.
+          elif [ "$AUTH_OUTCOME" != success ] || {
+               [ "${AUTH_STATE:-}" = REGISTRY_AUTH_FAILED ] ||
+               [ "${AUTH_STATE:-}" = REGISTRY_AUTH_LOCKED_OUT ] ||
+               [ "${AUTH_STATE:-}" = REGISTRY_AUTH_UNVERIFIED ]
+             }; then
+            # Owner-blocked auth soft-exits 0 but still emits AUTH_STATE. Classify
+            # from that state; REGISTRY_AUTH_FAILED remains reserved for observed 401.
             case "${AUTH_STATE:-}" in
               REGISTRY_AUTH_FAILED|REGISTRY_AUTH_LOCKED_OUT|REGISTRY_AUTH_UNVERIFIED) result="$AUTH_STATE" ;;
               *) result=REGISTRY_AUTH_UNVERIFIED ;;
