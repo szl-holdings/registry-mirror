@@ -379,10 +379,14 @@ class ReceiptFinalizerTests(unittest.TestCase):
             # verified anything; REGISTRY_AUTH_FAILED is reserved for an observed 401.
             ({"auth": "failure", "mirror": "skipped"}, "REGISTRY_AUTH_UNVERIFIED"),
         )
+        soft_ok = {"SETUP_REQUIRED"}
         for settings, expected in cases:
             with self.subTest(expected=expected):
                 result, receipt = self.run_case(**settings)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                if expected in soft_ok:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(receipt["summary"], {expected: 1})
                 self.assertEqual(receipt["entries"], [{"result": expected}])
 
@@ -404,21 +408,21 @@ class ReceiptFinalizerTests(unittest.TestCase):
                     auth="failure", mirror="skipped", auth_state=state,
                     auth_http_status=status, auth_secret_defects=defects,
                 )
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotEqual(result.returncode, 0)
                 expected = state if state.startswith("REGISTRY_AUTH_") else "REGISTRY_AUTH_UNVERIFIED"
                 self.assertEqual(receipt["summary"], {expected: 1})
                 self.assertEqual(receipt["entries"], [dict(detail, result=expected)])
 
-    def test_soft_exit_owner_auth_failures_are_still_receipted(self):
-        # Auth soft-exits 0 for owner-blocked states; finalize must still classify.
+    def test_auth_failure_receipts_fail_closed(self):
+        # Auth hard-fails; finalize still classifies REGISTRY_AUTH_FAILED and exits non-zero.
         result, receipt = self.run_case(
-            auth="success",
+            auth="failure",
             mirror="skipped",
             auth_state="REGISTRY_AUTH_FAILED",
             auth_http_status="401",
             auth_secret_defects="TOKEN_NON_ASCII_OR_CONTROL_CHARACTERS",
         )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotEqual(result.returncode, 0)
         self.assertEqual(receipt["summary"], {"REGISTRY_AUTH_FAILED": 1})
         self.assertEqual(
             receipt["entries"],
@@ -434,7 +438,7 @@ class ReceiptFinalizerTests(unittest.TestCase):
         result, receipt = self.run_case(
             mirror="failure", prior_lines=[{"image": "first", "result": "MIRRORED_VERIFIED"}]
         )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotEqual(result.returncode, 0)
         self.assertEqual(receipt["summary"], {"MIRRORED_VERIFIED": 1, "MIRROR_STEP_FAILED": 1})
 
     def test_valid_mirror_receipt_is_not_rewritten(self):
@@ -519,13 +523,13 @@ class DockerHubCredentialCheckTests(unittest.TestCase):
         for http, state, status in cases:
             with self.subTest(http=http):
                 result, outputs, curl_calls, crane_calls = self.run_case(http)
-                # Owner-blocked auth is MEASURED-failed: soft-exit 0, never mirror.
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                # Auth failure hard-fails the job; mirroring is never attempted.
+                self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(outputs["state"], state)
                 self.assertEqual(outputs["http_status"], status)
                 self.assertEqual(outputs["secret_defects"], "")
                 self.assertEqual(len(curl_calls), 1)
-                self.assertIn("::warning title=" + state + "::", result.stdout)
+                self.assertIn("::error title=" + state + "::", result.stdout)
                 # Docker Hub credentials are never written for the mirror loop to reuse.
                 self.assertEqual([call["args"][2] for call in crane_calls], ["ghcr.io"])
                 self.assert_secrets_not_exposed(result, curl_calls, crane_calls, self.USERNAME, self.TOKEN)
@@ -549,12 +553,12 @@ class DockerHubCredentialCheckTests(unittest.TestCase):
                     )
                     with mock.patch(__name__ + ".FAKE_CURL", fake):
                         result, outputs, curl_calls, crane_calls = self.run_case(http)
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertNotEqual(result.returncode, 0)
                     self.assertEqual(outputs["state"], state)
                     self.assertEqual(outputs["http_status"], http)
                     self.assertEqual(len(curl_calls), 1)
                     self.assertEqual([c["args"][2] for c in crane_calls], ["ghcr.io"])
-                    self.assertIn("::warning title=" + state + "::", result.stdout)
+                    self.assertIn("::error title=" + state + "::", result.stdout)
                     self.assertNotIn(marker, result.stdout + result.stderr)
                     self.assert_secrets_not_exposed(
                         result, curl_calls, crane_calls, self.USERNAME, self.TOKEN
@@ -607,13 +611,13 @@ class DockerHubCredentialCheckTests(unittest.TestCase):
         for username, token, expected in cases:
             with self.subTest(expected=expected):
                 result, outputs, curl_calls, crane_calls = self.run_case("401", username, token)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(outputs["state"], "REGISTRY_AUTH_FAILED")
                 self.assertEqual(outputs["secret_defects"].split(","), expected)
                 self.assertEqual(len(curl_calls), 1)
                 for defect in expected:
                     self.assertIn("::warning title=DOCKERHUB_SECRET_DEFECT::" + defect, result.stdout)
-                self.assertIn("::warning title=REGISTRY_AUTH_FAILED::", result.stdout)
+                self.assertIn("::error title=REGISTRY_AUTH_FAILED::", result.stdout)
                 self.assert_secrets_not_exposed(result, curl_calls, crane_calls, username, token)
 
     def test_defects_do_not_block_credentials_docker_hub_accepts(self):
