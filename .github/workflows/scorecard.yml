@@ -20,5 +20,6 @@ jobs:
       contents: read
       security-events: write
       id-token: write
+    # No `secrets: inherit`: the reusable workflow at this SHA declares and reads no secrets,
+    # and this repository's only secrets are the Docker Hub pair the mirror job uses.
     uses: szl-holdings/.github/.github/workflows/reusable-scorecard.yml@8dfc69d1de7ec825294e5b5407cf96097106de4e
-    secrets: inherit

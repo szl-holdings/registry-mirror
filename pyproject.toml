@@ -1,3 +1,9 @@
+# registry-mirror is a GitHub Actions workflow (.github/workflows/mirror-dockerhub.yml) plus an
+# offline contract test suite (tests/). It is not a Python package: this file only describes the
+# test environment so `pip install -e '.[test]'` works. The built distribution contains no modules
+# (packages = []), the version is a metadata placeholder (the repository has no releases or tags),
+# and the "Private :: Do Not Upload" classifier makes PyPI reject any upload.
+
 [build-system]
 requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
@@ -5,16 +11,32 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "registry-mirror"
 version = "0.1.0"
-description = "Digest-preserving mirror of canonical ghcr.io/szl-holdings images to docker.io/szlholdings. GHCR stays source of truth. SETUP_REQUIRED until repo secrets exist; every copy digest-verified and"
+description = "Digest-preserving mirror of canonical ghcr.io/szl-holdings images to docker.io/szlholdings: a GitHub Actions workflow plus offline contract tests. GHCR stays the source of truth; every copy is digest-verified and receipted."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Stephen Lutar", email = "stephen@szlholdings.com" }]
+classifiers = [
+    "Private :: Do Not Upload",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Archiving :: Mirroring",
+]
 dependencies = []
+
+[project.optional-dependencies]
+# The suite is standard-library unittest; it also needs Bash and jq on PATH.
+test = []
 
 [project.urls]
 Homepage = "https://hub.docker.com/u/szlholdings"
-Repository = "https://github.com/szl-holdings/registry-mirror"
+Source = "https://github.com/szl-holdings/registry-mirror"
+Issues = "https://github.com/szl-holdings/registry-mirror/issues"
 
 [tool.setuptools]
 packages = []
@@ -24,5 +46,7 @@ line-length = 120
 target-version = "py311"
 extend-exclude = ["build", "dist", ".venv", "node_modules"]
 
+# Optional: pytest also collects the unittest suite if it is installed.
 [tool.pytest.ini_options]
 minversion = "7.0"
+testpaths = ["tests"]
