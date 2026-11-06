@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: If you use this software, please cite it using the metadata from this file.
+type: software
+title: szl-holdings/registry-mirror — Digest-preserving mirror of canonical ghcr.io/szl-holdings images
+  to docker.io/szlholdings
+version: 0.1.0
+date-released: '2026-11-05'
+license: Apache-2.0
+url: https://hub.docker.com/u/szlholdings
+repository-code: https://github.com/szl-holdings/registry-mirror
+authors:
+- family-names: Lutar
+  given-names: Stephen P.
+  name-suffix: Jr.
+  orcid: https://orcid.org/0009-0001-0110-4173
+  affiliation: SZL Holdings
+keywords:
+- crane
+- docker-hub
+- ghcr
+- governed-ai
+- mirror
+- supply-chain
+- szl-holdings
+- python

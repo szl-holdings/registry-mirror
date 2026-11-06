@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "registry-mirror"
+version = "0.1.0"
+description = "Digest-preserving mirror of canonical ghcr.io/szl-holdings images to docker.io/szlholdings. GHCR stays source of truth. SETUP_REQUIRED until repo secrets exist; every copy digest-verified and"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Stephen Lutar", email = "stephen@szlholdings.com" }]
+dependencies = []
+
+[project.urls]
+Homepage = "https://hub.docker.com/u/szlholdings"
+Repository = "https://github.com/szl-holdings/registry-mirror"
+
+[tool.setuptools]
+packages = []
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["build", "dist", ".venv", "node_modules"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
