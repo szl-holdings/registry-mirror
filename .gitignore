@@ -1,1 +1,7 @@
 __pycache__/
+*.py[cod]
+# Outputs of `pip install -e .` / `python -m build` (pyproject.toml).
+*.egg-info/
+build/
+dist/
+.venv/
