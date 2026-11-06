@@ -86,3 +86,9 @@ job with an external write and a registry credential belongs behind its own repo
 repository-scoped secrets, not inside the org trust root.
 
 Apache-2.0. Λ = Conjecture 1.
+
+Estate on Hugging Face: models, datasets and Spaces are published under the [SZLHOLDINGS](https://huggingface.co/SZLHOLDINGS) org.
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE).
