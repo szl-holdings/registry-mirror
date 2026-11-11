@@ -186,6 +186,11 @@ jobs:
             # crane error formats stay failures until explicitly reviewed.
             tail -n 1 "$crane_error" | grep -Eq '^Error: (fetching manifest [^[:space:]]+: )?(GET https?://[^[:space:]]+: )?(unexpected status code 404 Not Found|MANIFEST_UNKNOWN: (manifest unknown|tag is absent)(; unknown tag=[^[:space:];]+)?|NAME_UNKNOWN: (repository name not known to registry|repository is absent)(; name=[^[:space:];]+)?)$'
           }
+          valid_digest() {
+            # Exit zero alone is not digest evidence. Admit supported canonical
+            # OCI SHA-256/SHA-512 values before comparing or copying them.
+            [[ "$1" =~ ^sha256:[0-9a-f]{64}$ || "$1" =~ ^sha512:[0-9a-f]{128}$ ]]
+          }
           for img in $IMAGES; do
             # A failed listing is not proof that a source has no release tags.
             # Discard even partial stdout until the complete listing succeeds.
@@ -209,6 +214,11 @@ jobs:
                 if registry_access_blocked; then break 2; fi
                 continue
               fi
+              if ! valid_digest "$sdig"; then
+                fail=1
+                jq -cn --arg i "$img" --arg t "$t" '{image:$i, tag:$t, result:"SOURCE_DIGEST_INVALID"}' >> receipt.jsonl
+                continue
+              fi
               if ! ddig="$(./crane digest "$dst" 2>"$crane_error")"; then
                 if registry_access_blocked; then
                   cat "$crane_error" >&2
@@ -224,6 +234,10 @@ jobs:
                 fi
                 # A destination tag that does not exist yet still needs its first copy.
                 ddig=""
+              elif ! valid_digest "$ddig"; then
+                fail=1
+                jq -cn --arg i "$img" --arg t "$t" '{image:$i, tag:$t, result:"DESTINATION_DIGEST_INVALID"}' >> receipt.jsonl
+                continue
               fi
               if [ "$sdig" = "$ddig" ]; then
                 jq -cn --arg i "$img" --arg t "$t" --arg d "$sdig" '{image:$i, tag:$t, digest:$d, result:"ALREADY_IDENTICAL"}' >> receipt.jsonl; continue
@@ -236,6 +250,11 @@ jobs:
                   fail=1
                   jq -cn --arg i "$img" --arg t "$t" '{image:$i, tag:$t, result:"DESTINATION_DIGEST_FAILED"}' >> receipt.jsonl
                   if registry_access_blocked; then break 2; fi
+                  continue
+                fi
+                if ! valid_digest "$ndig"; then
+                  fail=1
+                  jq -cn --arg i "$img" --arg t "$t" '{image:$i, tag:$t, result:"DESTINATION_DIGEST_INVALID"}' >> receipt.jsonl
                   continue
                 fi
                 if [ "$sdig" = "$ndig" ]; then

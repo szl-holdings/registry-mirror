@@ -24,7 +24,7 @@ with open("crane-calls.jsonl", "a", encoding="utf-8") as log:
 scenario = os.environ["TEST_SCENARIO"]
 state = Path("copied.json")
 copied = json.loads(state.read_text()) if state.exists() else {}
-digest = "sha256:" + "a" * 64
+digest = os.environ.get("TEST_DIGEST", "sha256:" + "a" * 64)
 
 def blocked():
     status = os.environ.get("TEST_STATUS", "401")
@@ -57,6 +57,8 @@ elif args[0] == "digest":
         print(digest)
     elif scenario == "blocked_digest":
         blocked()
+    elif scenario == "invalid_destination_digest":
+        print(os.environ["TEST_INVALID_DIGEST"])
     elif scenario in {"transient_destination_digest", "transport_destination_digest", "mixed_destination_digest"} and ref.endswith("/first:latest"):
         if scenario == "transport_destination_digest":
             print("Error: connection reset by peer", file=sys.stderr)
@@ -68,6 +70,9 @@ elif args[0] == "digest":
     elif scenario == "identical":
         print(digest)
     elif ref in copied:
+        if scenario == "invalid_postcopy_digest":
+            print(os.environ["TEST_INVALID_DIGEST"])
+            raise SystemExit(0)
         if scenario == "blocked_verification":
             blocked()
         print("sha256:" + "b" * 64 if scenario == "mismatch" else copied[ref])
@@ -161,7 +166,7 @@ def finalize_script():
 
 
 class MirrorContractTests(unittest.TestCase):
-    def run_case(self, scenario, status="401"):
+    def run_case(self, scenario, status="401", *, digest=None, invalid_digest=""):
         with tempfile.TemporaryDirectory() as directory:
             cwd = Path(directory)
             crane = cwd / "crane"
@@ -174,6 +179,8 @@ class MirrorContractTests(unittest.TestCase):
                     "PATH": os.environ["PATH"],
                     "TEST_SCENARIO": scenario,
                     "TEST_STATUS": status,
+                    "TEST_DIGEST": digest if digest is not None else "sha256:" + "a" * 64,
+                    "TEST_INVALID_DIGEST": invalid_digest,
                     "SOURCE_ORG": "ghcr.io/example",
                     "DEST_ORG": "docker.io/example",
                     "IMAGES": "first second",
@@ -329,6 +336,36 @@ class MirrorContractTests(unittest.TestCase):
         result, calls, receipt = self.run_case("mismatch")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(receipt["summary"], {"DIGEST_MISMATCH": 4})
+
+    def test_malformed_source_digest_never_proves_identical_or_permits_copy(self):
+        for digest in ('', 'sha256:abc', 'sha256:' + 'a' * 63, 'sha256:' + 'G' * 64,
+                       'sha256:' + 'a' * 64 + '\nextra', ' sha256:' + 'a' * 64):
+            with self.subTest(digest=digest):
+                result, calls, receipt = self.run_case('identical', digest=digest)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(receipt['summary'], {'SOURCE_DIGEST_INVALID': 4})
+                self.assertFalse(any(call[0] == 'copy' for call in calls))
+                self.assertFalse(any(call[0] == 'digest' and call[1].startswith('docker.io/') for call in calls))
+
+    def test_malformed_destination_digest_is_unknown_not_absent(self):
+        for digest in ('', 'sha256:abc', 'sha256:' + 'G' * 64):
+            with self.subTest(digest=digest):
+                result, calls, receipt = self.run_case('invalid_destination_digest', invalid_digest=digest)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(receipt['summary'], {'DESTINATION_DIGEST_INVALID': 4})
+                self.assertFalse(any(call[0] == 'copy' for call in calls))
+
+    def test_malformed_postcopy_digest_cannot_claim_verified(self):
+        result, calls, receipt = self.run_case('invalid_postcopy_digest')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(receipt['summary'], {'DESTINATION_DIGEST_INVALID': 4})
+        self.assertEqual(len([call for call in calls if call[0] == 'copy']), 4)
+
+    def test_sha512_digest_is_preserved_when_identical(self):
+        result, calls, receipt = self.run_case('identical', digest='sha512:' + 'b' * 128)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(receipt['summary'], {'ALREADY_IDENTICAL': 4})
+        self.assertFalse(any(call[0] == 'copy' for call in calls))
 
 
 class ReceiptFinalizerTests(unittest.TestCase):
