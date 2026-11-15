@@ -1,5 +1,7 @@
 # No `version` / `date-released`: this repository has no releases or tags to cite.
 cff-version: 1.2.0
+# Zenodo (InvenioRDM) DOI - always resolves to the latest version of this archive
+doi: 10.5281/zenodo.24240164
 message: If you use this software, please cite it using the metadata from this file.
 type: software
 title: szl-holdings/registry-mirror — Digest-preserving mirror of canonical ghcr.io/szl-holdings images
